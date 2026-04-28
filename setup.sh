@@ -33,7 +33,7 @@ if $USER_MODE; then
     echo ""
     echo "Activate and run:"
     echo "  source $SCRIPT_DIR/venv/bin/activate"
-    echo "  python3 $SCRIPT_DIR/kali_mcp_server.py --sse --port $PORT"
+    echo "  python3 $SCRIPT_DIR/kali_mcp_server.py --http --port $PORT"
     echo ""
     echo "Or for Claude Code CLI (stdio mode):"
     echo "  claude mcp add $SERVICE_NAME $SCRIPT_DIR/venv/bin/python3 $SCRIPT_DIR/kali_mcp_server.py"
@@ -75,7 +75,7 @@ Type=simple
 User=${RUN_AS}
 Group=${RUN_AS}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${VENV_DIR}/bin/python3 ${INSTALL_DIR}/kali_mcp_server.py --sse --host 0.0.0.0 --port ${PORT}
+ExecStart=${VENV_DIR}/bin/python3 ${INSTALL_DIR}/kali_mcp_server.py --http --host 0.0.0.0 --port ${PORT}
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

@@ -32,7 +32,7 @@ The server supports two transports so it works with **any MCP client**:
 | Mode | Flag | Use case |
 |---|---|---|
 | **stdio** | *(default)* | Claude Code CLI, Cursor, Continue — client spawns the process |
-| **SSE / HTTP** | `--sse` | Claude Desktop, remote clients, systemd service |
+| **HTTP** | `--http` | LM Studio, Claude Desktop, remote clients, systemd service — exposes both `/mcp` (Streamable HTTP) and `/sse` (legacy SSE) |
 
 ---
 
@@ -82,10 +82,10 @@ venv/bin/python3 kali_mcp_server.py
 
 ```bash
 # with venv active
-python3 kali_mcp_server.py --sse --host 0.0.0.0 --port 8765
+python3 kali_mcp_server.py --http --host 0.0.0.0 --port 8765
 
 # or full path
-venv/bin/python3 kali_mcp_server.py --sse --host 0.0.0.0 --port 8765
+venv/bin/python3 kali_mcp_server.py --http --host 0.0.0.0 --port 8765
 ```
 
 The server will be reachable at `http://<your-kali-ip>:8765/sse`.
@@ -167,7 +167,7 @@ These clients support either stdio or SSE. Use the stdio config if the client is
 - The `run_shell_command` tool blocks a list of destructive patterns (`rm -rf`, `shutdown`, `mkfs`, etc.) but is not a full sandbox. Restrict access to trusted users.
 - In SSE mode, the server binds to `0.0.0.0` by default. Use a firewall rule or bind to `127.0.0.1` if you only need local access:
   ```bash
-  python3 kali_mcp_server.py --sse --host 127.0.0.1 --port 8765
+  python3 kali_mcp_server.py --http --host 127.0.0.1 --port 8765
   ```
 - The systemd service runs as your user (not root) and sets `NoNewPrivileges=true` and `PrivateTmp=true`.
 
