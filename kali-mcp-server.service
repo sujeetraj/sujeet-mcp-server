@@ -1,0 +1,35 @@
+[Unit]
+Description=Kali Linux MCP Server (SSE/HTTP)
+Documentation=https://modelcontextprotocol.io
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change this to the user you want to run the server as (NOT root recommended)
+User=kali
+Group=kali
+
+WorkingDirectory=/opt/kali-mcp-server
+
+# Full path to python3 and the server script
+ExecStart=/usr/bin/python3 /opt/kali-mcp-server/kali_mcp_server.py \
+    --sse \
+    --host 0.0.0.0 \
+    --port 8765
+
+# Restart automatically on crash
+Restart=on-failure
+RestartSec=5
+
+# Logging goes to journald — view with: journalctl -u kali-mcp-server -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kali-mcp-server
+
+# Harden the service slightly
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /Users/sujeetkumar/Documents/Projects/sujeet-mcp-server/setup.sh)"
+    ]
+  }
+}

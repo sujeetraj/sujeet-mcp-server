@@ -1,0 +1,8 @@
+{
+  "_comment": "Use this block to connect Claude Desktop to the Kali MCP Server running as a service.",
+  "mcpServers": {
+    "kali-mcp-server": {
+      "url": "http://<KALI-IP>:8765/sse"
+    }
+  }
+}
