@@ -53,6 +53,15 @@ cp "$SCRIPT_DIR/kali_mcp_server.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt"   "$INSTALL_DIR/"
 ok "Files copied."
 
+# helper: re-copy latest server without full reinstall
+if [[ "${1:-}" == "--update" ]]; then
+    info "Update mode: copying latest server file and restarting service..."
+    cp "$SCRIPT_DIR/kali_mcp_server.py" "$INSTALL_DIR/"
+    systemctl restart "$SERVICE_NAME"
+    ok "Service restarted with updated server."
+    exit 0
+fi
+
 # ── step 2: create venv and install dependencies ──────────────────────────────
 info "Creating Python venv at $VENV_DIR ..."
 python3 -m venv "$VENV_DIR"

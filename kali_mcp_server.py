@@ -243,71 +243,10 @@ def run_shell_command(command: str, timeout: int = 60) -> str:
     return f"$ {command}\n\n{_run(['bash', '-c', command], timeout=timeout)}"
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Kali Linux MCP Server")
-    parser.add_argument(
-        "--http", action="store_true",
-        help="Run in HTTP mode — serves both Streamable HTTP (/mcp) and legacy SSE (/sse). "
-             "Use this for LM Studio, Claude Desktop, or any remote MCP client.",
-    )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
-    args = parser.parse_args()
-
-    if args.http:
-        _start_http(args.host, args.port)
-    else:
-        # stdio mode — client (Claude Code CLI, Cursor, Continue…) spawns this process
-        mcp.run(transport="stdio")
-
-
-def _start_http(host: str, port: int) -> None:
-    """Start the HTTP server, trying FastMCP API variants across mcp versions."""
-    try:
-        import uvicorn
-    except ImportError:
-        print("HTTP mode requires uvicorn:  pip install uvicorn starlette", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Kali MCP Server (HTTP) → http://{host}:{port}/sse", file=sys.stderr)
-
-    # ── Try each FastMCP HTTP API variant in version order ────────────────────
-
-    # 1. mcp ≥ 1.6  — get_app() returns a full Starlette app with /mcp + /sse
-    if hasattr(mcp, "get_app"):
-        print(f"                         http://{host}:{port}/mcp  (Streamable HTTP)", file=sys.stderr)
-        uvicorn.run(mcp.get_app(), host=host, port=port, log_level="info")
-        return
-
-    # 2. mcp 1.2–1.5 — sse_app() returns a Starlette app with /sse + /messages/
-    if hasattr(mcp, "sse_app"):
-        uvicorn.run(mcp.sse_app(), host=host, port=port, log_level="info")
-        return
-
-    # 3. mcp 1.1  — run(transport="sse") delegates to uvicorn internally
-    #    Some builds accept host/port kwargs, others don't.
-    try:
-        mcp.run(transport="sse", host=host, port=port)
-        return
-    except TypeError:
-        pass
-
-    try:
-        mcp.run(transport="sse")
-        return
-    except Exception:
-        pass
-
-    # 4. Last resort: manual SseServerTransport via Starlette
-    print("[warn] FastMCP HTTP helpers unavailable — falling back to manual SSE transport", file=sys.stderr)
-    _start_http_manual(host, port)
-
+# ── HTTP server helpers (defined BEFORE __main__ so they are in scope) ────────
 
 def _start_http_manual(host: str, port: int) -> None:
     """Fallback: manual SseServerTransport for very old mcp builds."""
-    import asyncio
     from mcp.server import Server as _Server
     from mcp.server.models import InitializationOptions
     from mcp.server.sse import SseServerTransport
@@ -318,10 +257,8 @@ def _start_http_manual(host: str, port: int) -> None:
     _srv = _Server("kali-mcp-server")
     _transport = SseServerTransport("/messages/")
 
-    # Re-register handlers on the low-level server
     @_srv.list_tools()
     async def _list_tools():
-        # delegate to FastMCP's registered tools
         return await mcp._mcp_server.list_tools()
 
     @_srv.call_tool()
@@ -343,3 +280,59 @@ def _start_http_manual(host: str, port: int) -> None:
         Mount("/messages/", app=_transport.handle_post_message),
     ])
     uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+def _start_http(host: str, port: int) -> None:
+    """Start the HTTP server, trying FastMCP API variants across mcp versions."""
+    try:
+        import uvicorn
+    except ImportError:
+        print("HTTP mode requires uvicorn:  pip install uvicorn starlette", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Kali MCP Server (HTTP) → http://{host}:{port}/sse", file=sys.stderr)
+
+    # 1. mcp ≥ 1.6 — get_app() returns Starlette app with /mcp + /sse
+    if hasattr(mcp, "get_app"):
+        print(f"                         http://{host}:{port}/mcp  (Streamable HTTP)", file=sys.stderr)
+        uvicorn.run(mcp.get_app(), host=host, port=port, log_level="info")
+        return
+
+    # 2. mcp 1.2–1.5 — sse_app() returns Starlette app with /sse + /messages/
+    if hasattr(mcp, "sse_app"):
+        uvicorn.run(mcp.sse_app(), host=host, port=port, log_level="info")
+        return
+
+    # 3. mcp 1.1 — run(transport="sse") with optional host/port kwargs
+    try:
+        mcp.run(transport="sse", host=host, port=port)
+        return
+    except TypeError:
+        pass
+    try:
+        mcp.run(transport="sse")
+        return
+    except Exception:
+        pass
+
+    # 4. Last resort: manual SseServerTransport
+    print("[warn] falling back to manual SSE transport", file=sys.stderr)
+    _start_http_manual(host, port)
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Kali Linux MCP Server")
+    parser.add_argument(
+        "--http", action="store_true",
+        help="Run in HTTP mode (LM Studio, Claude Desktop, any remote MCP client).",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    args = parser.parse_args()
+
+    if args.http:
+        _start_http(args.host, args.port)
+    else:
+        mcp.run(transport="stdio")
