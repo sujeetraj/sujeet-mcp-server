@@ -257,22 +257,89 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.http:
-        try:
-            import uvicorn
-        except ImportError:
-            print("HTTP mode requires uvicorn: pip install uvicorn starlette", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Kali MCP Server (HTTP) → http://{args.host}:{args.port}/sse", file=sys.stderr)
-        print(f"                         http://{args.host}:{args.port}/mcp  (Streamable HTTP)", file=sys.stderr)
-
-        # FastMCP exposes a Starlette app that handles BOTH:
-        #   GET  /sse          → legacy SSE stream (LM Studio fallback, Claude Desktop)
-        #   POST /messages/    → legacy SSE messages
-        #   POST /mcp          → Streamable HTTP (new spec, LM Studio primary)
-        #   GET  /mcp          → Streamable HTTP SSE upgrade
-        app = mcp.get_app()
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        _start_http(args.host, args.port)
     else:
         # stdio mode — client (Claude Code CLI, Cursor, Continue…) spawns this process
         mcp.run(transport="stdio")
+
+
+def _start_http(host: str, port: int) -> None:
+    """Start the HTTP server, trying FastMCP API variants across mcp versions."""
+    try:
+        import uvicorn
+    except ImportError:
+        print("HTTP mode requires uvicorn:  pip install uvicorn starlette", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Kali MCP Server (HTTP) → http://{host}:{port}/sse", file=sys.stderr)
+
+    # ── Try each FastMCP HTTP API variant in version order ────────────────────
+
+    # 1. mcp ≥ 1.6  — get_app() returns a full Starlette app with /mcp + /sse
+    if hasattr(mcp, "get_app"):
+        print(f"                         http://{host}:{port}/mcp  (Streamable HTTP)", file=sys.stderr)
+        uvicorn.run(mcp.get_app(), host=host, port=port, log_level="info")
+        return
+
+    # 2. mcp 1.2–1.5 — sse_app() returns a Starlette app with /sse + /messages/
+    if hasattr(mcp, "sse_app"):
+        uvicorn.run(mcp.sse_app(), host=host, port=port, log_level="info")
+        return
+
+    # 3. mcp 1.1  — run(transport="sse") delegates to uvicorn internally
+    #    Some builds accept host/port kwargs, others don't.
+    try:
+        mcp.run(transport="sse", host=host, port=port)
+        return
+    except TypeError:
+        pass
+
+    try:
+        mcp.run(transport="sse")
+        return
+    except Exception:
+        pass
+
+    # 4. Last resort: manual SseServerTransport via Starlette
+    print("[warn] FastMCP HTTP helpers unavailable — falling back to manual SSE transport", file=sys.stderr)
+    _start_http_manual(host, port)
+
+
+def _start_http_manual(host: str, port: int) -> None:
+    """Fallback: manual SseServerTransport for very old mcp builds."""
+    import asyncio
+    from mcp.server import Server as _Server
+    from mcp.server.models import InitializationOptions
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.routing import Route, Mount
+    import uvicorn
+
+    _srv = _Server("kali-mcp-server")
+    _transport = SseServerTransport("/messages/")
+
+    # Re-register handlers on the low-level server
+    @_srv.list_tools()
+    async def _list_tools():
+        # delegate to FastMCP's registered tools
+        return await mcp._mcp_server.list_tools()
+
+    @_srv.call_tool()
+    async def _call_tool(name, arguments):
+        return await mcp._mcp_server.call_tool(name, arguments)
+
+    init_opts = InitializationOptions(
+        server_name="kali-mcp-server",
+        server_version="1.0.0",
+        capabilities=_srv.get_capabilities(notification_options=None, experimental_capabilities={}),
+    )
+
+    async def handle_sse(request):
+        async with _transport.connect_sse(request.scope, request.receive, request._send) as streams:
+            await _srv.run(streams[0], streams[1], init_opts)
+
+    app = Starlette(routes=[
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=_transport.handle_post_message),
+    ])
+    uvicorn.run(app, host=host, port=port, log_level="info")
