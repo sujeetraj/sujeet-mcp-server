@@ -54,14 +54,12 @@ cd sujeet-mcp-server
 
 ### 2. Install dependencies
 
-```bash
-pip3 install --user -r requirements.txt
-```
-
-Or system-wide (needed for the systemd service):
+Kali Linux (Python 3.13+) blocks system-wide pip installs. Use a venv instead:
 
 ```bash
-sudo pip3 install -r requirements.txt
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ---
@@ -73,13 +71,21 @@ sudo pip3 install -r requirements.txt
 The client spawns the server process directly over stdin/stdout. No extra setup needed.
 
 ```bash
+# with venv active
 python3 kali_mcp_server.py
+
+# or full path without activating
+venv/bin/python3 kali_mcp_server.py
 ```
 
 ### SSE / HTTP mode (for remote or Desktop clients)
 
 ```bash
+# with venv active
 python3 kali_mcp_server.py --sse --host 0.0.0.0 --port 8765
+
+# or full path
+venv/bin/python3 kali_mcp_server.py --sse --host 0.0.0.0 --port 8765
 ```
 
 The server will be reachable at `http://<your-kali-ip>:8765/sse`.
