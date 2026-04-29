@@ -54,20 +54,66 @@ except Exception as e:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _run(cmd: list[str], timeout: int = 120) -> str:
-    """Run a shell command and return combined output string."""
+# Maximum bytes of output to return to the LLM. Larger outputs blow the context
+# window. ~10 KB is enough for almost any tool's interesting output.
+_MAX_OUTPUT_BYTES = 10_000
+
+# Map binary name → apt package name (when they differ)
+_APT_PACKAGE_MAP = {
+    "msfconsole":   "metasploit-framework",
+    "theHarvester": "theharvester",
+    "subfinder":    "subfinder",
+    "ffuf":         "ffuf",
+    "wafw00f":      "wafw00f",
+    "wpscan":       "wpscan",
+    "nuclei":       "nuclei",
+    "searchsploit": "exploitdb",
+    "smbmap":       "smbmap",
+    "enum4linux":   "enum4linux",
+    "exiftool":     "libimage-exiftool-perl",
+}
+
+
+def _truncate(text: str) -> str:
+    """Cap output to _MAX_OUTPUT_BYTES so we don't flood the LLM context."""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= _MAX_OUTPUT_BYTES:
+        return text
+    head = encoded[: _MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    omitted = len(encoded) - _MAX_OUTPUT_BYTES
+    return f"{head}\n\n[... output truncated, {omitted} more bytes omitted ...]"
+
+
+def _require(binary: str) -> Optional[str]:
+    """Return None if `binary` is on PATH, otherwise return an install hint."""
+    if shutil.which(binary):
+        return None
+    pkg = _APT_PACKAGE_MAP.get(binary, binary)
+    return (
+        f"[not installed] '{binary}' is not on this system.\n"
+        f"Install it with:  sudo apt install -y {pkg}"
+    )
+
+
+def _run(cmd: list[str], timeout: int = 120, stdin: Optional[str] = None) -> str:
+    """Run a shell command and return combined output string (truncated)."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=timeout, input=stdin,
+        )
         parts = []
         if r.stdout.strip():
             parts.append(r.stdout.strip())
         if r.stderr.strip():
             parts.append(f"[stderr]\n{r.stderr.strip()}")
-        return "\n".join(parts) if parts else f"(no output, exit code {r.returncode})"
+        out = "\n".join(parts) if parts else f"(no output, exit code {r.returncode})"
+        return _truncate(out)
     except subprocess.TimeoutExpired:
         return f"[timeout] Command exceeded {timeout}s: {' '.join(cmd)}"
     except FileNotFoundError:
-        return f"[not found] {cmd[0]} is not installed on this system."
+        hint = _require(cmd[0])
+        return hint or f"[not found] {cmd[0]}"
     except Exception as e:
         return f"[error] {e}"
 
@@ -218,16 +264,395 @@ def hash_identify(hash_value: str) -> str:
 
 @mcp.tool()
 def list_installed_tools() -> str:
-    """List common Kali Linux security tools and show whether each is installed."""
-    tools = [
-        "nmap", "nikto", "gobuster", "sqlmap", "msfconsole",
-        "hydra", "john", "hashcat", "aircrack-ng", "wireshark",
-        "dirb", "wfuzz", "whatweb", "dnsenum", "fierce",
-        "theHarvester", "netcat", "socat", "hashid",
-        "binwalk", "volatility3", "autopsy",
-    ]
-    lines = [f"  {'✓' if shutil.which(t) else '✗'}  {t}" for t in tools]
-    return "Kali Linux Tool Status:\n" + "\n".join(lines)
+    """List common Kali Linux security tools, grouped by category, with install status."""
+    categories = {
+        "Network scanning":     ["nmap", "masscan", "arp-scan", "traceroute", "netcat", "socat"],
+        "Recon / OSINT":        ["whois", "dig", "theHarvester", "subfinder", "whatweb",
+                                 "wafw00f", "dnsenum", "fierce"],
+        "Web app":              ["nikto", "gobuster", "ffuf", "dirb", "wfuzz", "wpscan",
+                                 "nuclei", "sqlmap"],
+        "Vuln assessment":      ["searchsploit"],
+        "SMB / AD":             ["enum4linux", "smbmap", "smbclient", "crackmapexec"],
+        "Password attacks":     ["hydra", "john", "hashcat", "hashid", "crunch"],
+        "Forensics / files":    ["binwalk", "strings", "exiftool", "file", "foremost"],
+        "Exploitation":         ["msfconsole"],
+        "Wireless":             ["aircrack-ng", "airmon-ng"],
+    }
+    out = ["Kali Linux Tool Status:"]
+    for cat, tools in categories.items():
+        out.append(f"\n[{cat}]")
+        for t in tools:
+            mark = "✓" if shutil.which(t) else "✗"
+            out.append(f"  {mark}  {t}")
+    return "\n".join(out)
+
+
+# ─── Reconnaissance / OSINT ────────────────────────────────────────────────────
+
+@mcp.tool()
+def theharvester_scan(domain: str, sources: str = "duckduckgo,bing,crtsh", limit: int = 100) -> str:
+    """
+    Harvest emails, subdomains, and hosts for a domain using public sources.
+    Passive reconnaissance — does not touch the target directly.
+
+    Args:
+        domain:  Target domain (e.g. example.com)
+        sources: Comma-separated source list (default: duckduckgo,bing,crtsh)
+        limit:   Max results per source (default: 100)
+    """
+    if (hint := _require("theHarvester")):
+        return hint
+    cmd = ["theHarvester", "-d", domain, "-l", str(limit), "-b", sources]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=180)}"
+
+
+@mcp.tool()
+def subfinder_scan(domain: str, all_sources: bool = False) -> str:
+    """
+    Passive subdomain enumeration via subfinder.
+
+    Args:
+        domain:      Target domain (e.g. example.com)
+        all_sources: Use all configured sources (slower but more thorough)
+    """
+    if (hint := _require("subfinder")):
+        return hint
+    cmd = ["subfinder", "-d", domain, "-silent"]
+    if all_sources:
+        cmd.append("-all")
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=120)}"
+
+
+@mcp.tool()
+def whatweb_scan(target: str, aggression: int = 1) -> str:
+    """
+    Identify web technologies running on a target (CMS, framework, server, etc.).
+
+    Args:
+        target:     URL or hostname (e.g. https://example.com)
+        aggression: 1=stealthy, 3=aggressive, 4=heavy (default: 1)
+    """
+    if (hint := _require("whatweb")):
+        return hint
+    cmd = ["whatweb", "-a", str(aggression), target]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def wafw00f_scan(target: str) -> str:
+    """
+    Detect and identify Web Application Firewalls in front of a target.
+
+    Args:
+        target: URL (e.g. https://example.com)
+    """
+    if (hint := _require("wafw00f")):
+        return hint
+    cmd = ["wafw00f", target]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+# ─── Network scanning ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+def masscan_scan(target: str, ports: str = "1-1000", rate: int = 1000) -> str:
+    """
+    Ultra-fast TCP port scanner. Requires root privileges (raw sockets).
+    Only use against authorized targets.
+
+    Args:
+        target: IP, range, or CIDR (e.g. 10.0.0.0/24)
+        ports:  Port spec (e.g. '80,443,8000-9000'), default '1-1000'
+        rate:   Packets per second (default: 1000)
+    """
+    if (hint := _require("masscan")):
+        return hint
+    cmd = ["masscan", target, "-p", ports, "--rate", str(rate)]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+
+
+@mcp.tool()
+def arp_scan(interface: Optional[str] = None, target: str = "--localnet") -> str:
+    """
+    Discover hosts on the local network via ARP requests. Requires root.
+
+    Args:
+        interface: Network interface (e.g. eth0). Auto-selected if omitted.
+        target:    '--localnet' for the local subnet, or a CIDR/IP range.
+    """
+    if (hint := _require("arp-scan")):
+        return hint
+    cmd = ["arp-scan"]
+    if interface:
+        cmd += ["-I", interface]
+    cmd.append(target)
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def traceroute_scan(target: str, max_hops: int = 30) -> str:
+    """
+    Trace the network path to a target host.
+
+    Args:
+        target:   Hostname or IP
+        max_hops: Maximum hops (default: 30)
+    """
+    if (hint := _require("traceroute")):
+        return hint
+    cmd = ["traceroute", "-m", str(max_hops), target]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+# ─── Web application ───────────────────────────────────────────────────────────
+
+@mcp.tool()
+def ffuf_scan(
+    url: str,
+    wordlist: str = "/usr/share/wordlists/dirb/common.txt",
+    extensions: Optional[str] = None,
+    match_codes: str = "200,204,301,302,307,401,403",
+) -> str:
+    """
+    Fast web fuzzer. URL must contain 'FUZZ' as the placeholder, e.g.
+    'https://example.com/FUZZ'.
+
+    Args:
+        url:         Target URL with FUZZ keyword (e.g. https://site.com/FUZZ)
+        wordlist:    Path to wordlist (default: dirb/common.txt)
+        extensions:  Comma-separated extensions, e.g. 'php,html'
+        match_codes: HTTP status codes to report (default: 200,204,301,302,307,401,403)
+    """
+    if (hint := _require("ffuf")):
+        return hint
+    if "FUZZ" not in url:
+        url = url.rstrip("/") + "/FUZZ"
+    cmd = ["ffuf", "-u", url, "-w", wordlist, "-mc", match_codes, "-s"]
+    if extensions:
+        cmd += ["-e", "," + extensions if not extensions.startswith(",") else extensions]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+
+
+@mcp.tool()
+def wpscan_scan(url: str, enumerate: str = "vp,vt,u") -> str:
+    """
+    WordPress vulnerability scanner. Requires WPSCAN_API_TOKEN env var for
+    full vulnerability data.
+
+    Args:
+        url:       WordPress site URL (e.g. https://blog.example.com)
+        enumerate: What to enum — 'vp' vuln plugins, 'vt' vuln themes,
+                   'u' users, 'ap' all plugins. Default: 'vp,vt,u'
+    """
+    if (hint := _require("wpscan")):
+        return hint
+    cmd = ["wpscan", "--url", url, "--enumerate", enumerate, "--no-update", "--random-user-agent"]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+
+
+@mcp.tool()
+def nuclei_scan(target: str, severity: str = "medium,high,critical", tags: Optional[str] = None) -> str:
+    """
+    Run nuclei template-based vulnerability scanner against a target.
+
+    Args:
+        target:   URL or hostname (e.g. https://example.com)
+        severity: Comma-separated levels — info,low,medium,high,critical
+                  (default: 'medium,high,critical')
+        tags:     Optional template tag filter (e.g. 'cve,exposure,misconfig')
+    """
+    if (hint := _require("nuclei")):
+        return hint
+    cmd = ["nuclei", "-u", target, "-severity", severity, "-silent", "-nc"]
+    if tags:
+        cmd += ["-tags", tags]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+
+
+# ─── Vulnerability assessment ──────────────────────────────────────────────────
+
+@mcp.tool()
+def nmap_vuln_scan(target: str, ports: Optional[str] = None) -> str:
+    """
+    Run nmap with the 'vuln' NSE script category — checks for known CVEs and
+    common vulnerabilities on open ports.
+
+    Args:
+        target: IP or hostname
+        ports:  Optional port spec (e.g. '80,443,8080'); defaults to top 1000
+    """
+    if (hint := _require("nmap")):
+        return hint
+    cmd = ["nmap", "-sV", "--script", "vuln"]
+    if ports:
+        cmd += ["-p", ports]
+    cmd.append(target)
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=600)}"
+
+
+@mcp.tool()
+def searchsploit_lookup(query: str) -> str:
+    """
+    Search the local Exploit-DB database for known exploits matching a query.
+
+    Args:
+        query: Search terms — software name, CVE, or keywords
+               (e.g. 'apache 2.4.49' or 'CVE-2021-41773')
+    """
+    if (hint := _require("searchsploit")):
+        return hint
+    cmd = ["searchsploit", "--color", "false"] + query.split()
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=30)}"
+
+
+# ─── SMB / Active Directory ────────────────────────────────────────────────────
+
+@mcp.tool()
+def enum4linux_scan(target: str, options: str = "-a") -> str:
+    """
+    Enumerate information from a Windows/Samba host (shares, users, groups,
+    policies, OS version).
+
+    Args:
+        target:  IP or hostname of the SMB server
+        options: enum4linux flags (default: '-a' for all checks)
+    """
+    if (hint := _require("enum4linux")):
+        return hint
+    cmd = ["enum4linux"] + options.split() + [target]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+
+
+@mcp.tool()
+def smbmap_scan(target: str, username: str = "", password: str = "") -> str:
+    """
+    List SMB shares and access permissions on a target.
+
+    Args:
+        target:   IP or hostname
+        username: SMB username (empty = anonymous/guest)
+        password: SMB password (empty = anonymous/guest)
+    """
+    if (hint := _require("smbmap")):
+        return hint
+    cmd = ["smbmap", "-H", target, "-u", username or "guest", "-p", password]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=120)}"
+
+
+# ─── Forensics / file analysis ─────────────────────────────────────────────────
+
+@mcp.tool()
+def binwalk_scan(file_path: str, extract: bool = False) -> str:
+    """
+    Analyze a binary or firmware file — find embedded files, signatures,
+    and known structures.
+
+    Args:
+        file_path: Absolute path to the file on the Kali machine
+        extract:   If True, also extract embedded data (-e flag)
+    """
+    if (hint := _require("binwalk")):
+        return hint
+    cmd = ["binwalk"]
+    if extract:
+        cmd.append("-e")
+    cmd.append(file_path)
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=120)}"
+
+
+@mcp.tool()
+def strings_extract(file_path: str, min_length: int = 6) -> str:
+    """
+    Extract printable strings from a binary file.
+
+    Args:
+        file_path:  Absolute path to the file
+        min_length: Minimum string length (default: 6)
+    """
+    if (hint := _require("strings")):
+        return hint
+    cmd = ["strings", "-n", str(min_length), file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def exiftool_read(file_path: str) -> str:
+    """
+    Read EXIF and other metadata from a file (image, PDF, document, etc.).
+
+    Args:
+        file_path: Absolute path to the file
+    """
+    if (hint := _require("exiftool")):
+        return hint
+    cmd = ["exiftool", file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=30)}"
+
+
+@mcp.tool()
+def file_info(file_path: str) -> str:
+    """
+    Identify the type of a file via magic-byte inspection.
+
+    Args:
+        file_path: Absolute path to the file
+    """
+    if (hint := _require("file")):
+        return hint
+    cmd = ["file", "-b", file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=10)}"
+
+
+# ─── TLS / certificate inspection ──────────────────────────────────────────────
+
+@mcp.tool()
+def openssl_cert_info(host: str, port: int = 443) -> str:
+    """
+    Connect to a TLS service and dump the server certificate (subject, issuer,
+    validity period, SANs, signature algorithm).
+
+    Args:
+        host: Hostname or IP
+        port: TLS port (default: 443)
+    """
+    if (hint := _require("openssl")):
+        return hint
+    # openssl s_client requires stdin closed to exit cleanly
+    fetch = ["openssl", "s_client", "-connect", f"{host}:{port}",
+             "-servername", host, "-showcerts"]
+    raw = _run(fetch, timeout=15, stdin="")
+    # Pipe certificate text into x509 for human-readable parsing
+    parse = ["openssl", "x509", "-noout", "-text"]
+    parsed = _run(parse, timeout=10, stdin=raw)
+    return f"$ openssl s_client → openssl x509\n\n{parsed}"
+
+
+# ─── Self-management ───────────────────────────────────────────────────────────
+
+@mcp.tool()
+def apt_install_tool(package: str) -> str:
+    """
+    Install a missing Kali tool via apt. Requires the MCP server to run as root
+    (or with passwordless sudo). Only standard Kali repository packages are allowed.
+
+    Args:
+        package: apt package name (e.g. 'nuclei', 'subfinder', 'wpscan')
+    """
+    # Whitelist of packages we're willing to auto-install — must match values
+    # in _APT_PACKAGE_MAP plus a few common extras.
+    allowed = set(_APT_PACKAGE_MAP.values()) | {
+        "nmap", "nikto", "gobuster", "sqlmap", "whatweb", "wafw00f",
+        "dnsenum", "fierce", "masscan", "arp-scan", "traceroute",
+        "ffuf", "dirb", "wfuzz", "wpscan", "nuclei", "exploitdb",
+        "enum4linux", "smbmap", "binwalk", "exiftool", "hashid",
+        "hydra", "john", "hashcat", "openssl",
+    }
+    if package not in allowed:
+        return f"[blocked] '{package}' is not in the allowed install list."
+
+    # Use DEBIAN_FRONTEND=noninteractive to skip prompts
+    cmd = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", package]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=600)}"
 
 
 @mcp.tool()

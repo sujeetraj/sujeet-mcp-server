@@ -8,20 +8,33 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 ## Features
 
-| Tool | Description |
-|---|---|
-| `system_info` | OS, kernel, user, network interfaces |
-| `nmap_scan` | Port & service scanning |
-| `nikto_scan` | Web vulnerability scanning |
-| `gobuster_scan` | Directory & file enumeration |
-| `sqlmap_scan` | SQL injection testing |
-| `whois_lookup` | WHOIS for domain / IP |
-| `dns_lookup` | DNS records via `dig` |
-| `ping_host` | ICMP reachability check |
-| `hash_identify` | Identify hash type via `hashid` |
-| `list_installed_tools` | Check which Kali tools are installed |
-| `netstat_info` | Connections, listening ports, routes |
-| `run_shell_command` | Run arbitrary commands (dangerous ones blocked) |
+32 tools exposed, grouped by pentesting phase:
+
+**System & shell**
+`system_info` · `list_installed_tools` · `netstat_info` · `run_shell_command` · `apt_install_tool`
+
+**Network scanning**
+`nmap_scan` · `nmap_vuln_scan` · `masscan_scan` · `arp_scan` · `traceroute_scan` · `ping_host`
+
+**Reconnaissance / OSINT**
+`whois_lookup` · `dns_lookup` · `theharvester_scan` · `subfinder_scan` · `whatweb_scan` · `wafw00f_scan`
+
+**Web application**
+`nikto_scan` · `gobuster_scan` · `ffuf_scan` · `wpscan_scan` · `nuclei_scan` · `sqlmap_scan`
+
+**Vulnerability assessment**
+`searchsploit_lookup`
+
+**SMB / Active Directory**
+`enum4linux_scan` · `smbmap_scan`
+
+**Forensics / file analysis**
+`binwalk_scan` · `strings_extract` · `exiftool_read` · `file_info`
+
+**Cryptography**
+`openssl_cert_info` · `hash_identify`
+
+> Output is automatically truncated to ~10 KB so large scan results don't blow the LLM context. Each tool checks if its binary is installed and, if not, prints the exact `apt install` command — Claude can then call `apt_install_tool` to self-heal.
 
 ---
 
