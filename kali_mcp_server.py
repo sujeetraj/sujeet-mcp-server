@@ -246,12 +246,14 @@ def run_shell_command(command: str, timeout: int = 60) -> str:
 # ── HTTP server helpers (defined BEFORE __main__ so they are in scope) ────────
 
 def _start_http_manual(host: str, port: int) -> None:
-    """Fallback: manual SseServerTransport for very old mcp builds."""
+    """
+    Manual SSE transport using raw ASGI (scope, receive, send).
+    Bypasses Starlette's Request wrapper — avoids the request._send
+    issue that breaks session lookup and causes HTTP 421 errors.
+    """
     from mcp.server import Server as _Server
     from mcp.server.models import InitializationOptions
     from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
     import uvicorn
 
     _srv = _Server("kali-mcp-server")
@@ -268,17 +270,33 @@ def _start_http_manual(host: str, port: int) -> None:
     init_opts = InitializationOptions(
         server_name="kali-mcp-server",
         server_version="1.0.0",
-        capabilities=_srv.get_capabilities(notification_options=None, experimental_capabilities={}),
+        capabilities=_srv.get_capabilities(
+            notification_options=None, experimental_capabilities={}
+        ),
     )
 
-    async def handle_sse(request):
-        async with _transport.connect_sse(request.scope, request.receive, request._send) as streams:
-            await _srv.run(streams[0], streams[1], init_opts)
+    # Raw ASGI handler — scope/receive/send passed directly, no Starlette wrapper
+    async def handle_sse(scope, receive, send):
+        async with _transport.connect_sse(scope, receive, send) as (read, write):
+            await _srv.run(read, write, init_opts)
 
-    app = Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=_transport.handle_post_message),
-    ])
+    # Minimal ASGI router — no Starlette overhead
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            return
+        path = scope.get("path", "")
+        if path == "/sse":
+            await handle_sse(scope, receive, send)
+        elif path.startswith("/messages"):
+            await _transport.handle_post_message(scope, receive, send)
+        else:
+            await send({
+                "type": "http.response.start", "status": 404,
+                "headers": [[b"content-type", b"text/plain"]],
+            })
+            await send({"type": "http.response.body", "body": b"Not found"})
+
+    print(f"Kali MCP Server → http://{host}:{port}/sse", file=sys.stderr)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
@@ -290,33 +308,19 @@ def _start_http(host: str, port: int) -> None:
         print("HTTP mode requires uvicorn:  pip install uvicorn starlette", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Kali MCP Server (HTTP) → http://{host}:{port}/sse", file=sys.stderr)
-
     # 1. mcp ≥ 1.6 — get_app() returns Starlette app with /mcp + /sse
     if hasattr(mcp, "get_app"):
-        print(f"                         http://{host}:{port}/mcp  (Streamable HTTP)", file=sys.stderr)
+        print(f"Kali MCP Server → http://{host}:{port}/sse + /mcp", file=sys.stderr)
         uvicorn.run(mcp.get_app(), host=host, port=port, log_level="info")
         return
 
     # 2. mcp 1.2–1.5 — sse_app() returns Starlette app with /sse + /messages/
     if hasattr(mcp, "sse_app"):
+        print(f"Kali MCP Server → http://{host}:{port}/sse  (sse_app)", file=sys.stderr)
         uvicorn.run(mcp.sse_app(), host=host, port=port, log_level="info")
         return
 
-    # 3. mcp 1.1 — run(transport="sse") with optional host/port kwargs
-    try:
-        mcp.run(transport="sse", host=host, port=port)
-        return
-    except TypeError:
-        pass
-    try:
-        mcp.run(transport="sse")
-        return
-    except Exception:
-        pass
-
-    # 4. Last resort: manual SseServerTransport
-    print("[warn] falling back to manual SSE transport", file=sys.stderr)
+    # 3. All other versions — raw ASGI manual transport (no request._send bug)
     _start_http_manual(host, port)
 
 
