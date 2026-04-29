@@ -27,6 +27,30 @@ mcp = FastMCP(
     ),
 )
 
+# ── disable DNS rebinding protection ──────────────────────────────────────────
+# mcp >= 1.10 ships with TransportSecurityMiddleware that rejects every
+# request whose Host header is not localhost. That kills remote clients
+# (LM Studio, Claude Desktop on a different machine, etc.) with
+# "ValueError: Request validation failed". We disable it here.
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    _security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+        allowed_hosts=["*"],
+        allowed_origins=["*"],
+    )
+    if hasattr(mcp, "settings") and hasattr(mcp.settings, "transport_security"):
+        mcp.settings.transport_security = _security
+    # Some versions store it on the underlying server
+    if hasattr(mcp, "_mcp_server"):
+        for attr in ("_security", "security", "_transport_security", "transport_security"):
+            if hasattr(mcp._mcp_server, attr):
+                setattr(mcp._mcp_server, attr, _security)
+except ImportError:
+    pass  # older mcp version, no DNS rebinding protection to disable
+except Exception as e:
+    print(f"[warn] could not disable DNS rebinding protection: {e}", file=sys.stderr)
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
