@@ -280,21 +280,38 @@ def _start_http_manual(host: str, port: int) -> None:
         async with _transport.connect_sse(scope, receive, send) as (read, write):
             await _srv.run(read, write, init_opts)
 
-    # Minimal ASGI router — no Starlette overhead
+    async def _send_status(send, status: int, body: bytes = b"") -> None:
+        await send({
+            "type": "http.response.start", "status": status,
+            "headers": [[b"content-type", b"text/plain"]],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    # Minimal ASGI router with strict method checks.
+    # Note: LM Studio first tries POST /sse (Streamable HTTP). We must return
+    # 405 instead of routing to connect_sse, otherwise mcp's request validation
+    # raises ValueError and crashes the worker.
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return
-        path = scope.get("path", "")
+        path   = scope.get("path", "")
+        method = scope.get("method", "GET")
+
         if path == "/sse":
-            await handle_sse(scope, receive, send)
+            if method == "GET":
+                try:
+                    await handle_sse(scope, receive, send)
+                except Exception as e:
+                    print(f"[sse error] {e}", file=sys.stderr)
+            else:
+                await _send_status(send, 405, b"Use GET for SSE")
         elif path.startswith("/messages"):
-            await _transport.handle_post_message(scope, receive, send)
+            if method == "POST":
+                await _transport.handle_post_message(scope, receive, send)
+            else:
+                await _send_status(send, 405, b"Use POST for messages")
         else:
-            await send({
-                "type": "http.response.start", "status": 404,
-                "headers": [[b"content-type", b"text/plain"]],
-            })
-            await send({"type": "http.response.body", "body": b"Not found"})
+            await _send_status(send, 404, b"Not found")
 
     print(f"Kali MCP Server → http://{host}:{port}/sse", file=sys.stderr)
     uvicorn.run(app, host=host, port=port, log_level="info")
