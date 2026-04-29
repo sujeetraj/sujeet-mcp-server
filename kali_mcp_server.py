@@ -112,16 +112,29 @@ def _audit(tool_name: str) -> Callable:
 mcp = FastMCP(
     name="kali-mcp-server",
     instructions=(
-        "Kali Linux MCP Server. Provides security testing tools including "
-        "nmap, nikto, gobuster, sqlmap, whois, dig, and more. "
-        "Use only against systems you are authorized to test."
+        "Kali Linux MCP Server. Provides security testing tools (nmap, nikto, "
+        "gobuster, sqlmap, nuclei, masscan, etc.). Use only against systems "
+        "you are authorized to test.\n\n"
+        "IMPORTANT — long-running scans:\n"
+        "Some tools take 30 seconds to several minutes. The MCP request "
+        "timeout is short, so for any heavy scan you MUST use background "
+        "jobs:\n"
+        "  1. Call start_background_job(tool_name, arguments) — returns a job_id\n"
+        "  2. Wait ~15-60 seconds, then call get_job(job_id)\n"
+        "  3. Repeat get_job() until status='done'\n"
+        "Tools that should normally be run via start_background_job: "
+        "nmap_scan (with -A or vuln scripts), nmap_vuln_scan, masscan_scan, "
+        "nikto_scan, gobuster_scan, ffuf_scan, sqlmap_scan, wpscan_scan, "
+        "nuclei_scan, enum4linux_scan, theharvester_scan."
     ),
 )
 
-# ── auto-audit every @mcp.tool() ──────────────────────────────────────────────
-# Wrap FastMCP's tool decorator so any function registered with @mcp.tool()
-# is automatically wrapped with @_audit(name) before registration.
+# ── auto-audit every @mcp.tool() and register in lookup table ─────────────────
+# Wrap FastMCP's tool decorator so each registered function:
+#   1. is automatically wrapped with @_audit() for logging
+#   2. is recorded in _TOOL_REGISTRY so background jobs can call it by name
 _original_tool = mcp.tool
+_TOOL_REGISTRY: dict[str, Callable] = {}
 
 def _tool_with_audit(*dargs, **dkwargs):
     inner_decorator = _original_tool(*dargs, **dkwargs)
@@ -129,10 +142,64 @@ def _tool_with_audit(*dargs, **dkwargs):
     def wrapper(fn):
         audited = _audit(fn.__name__)(fn)
         functools.update_wrapper(audited, fn)
+        _TOOL_REGISTRY[fn.__name__] = audited
         return inner_decorator(audited)
     return wrapper
 
 mcp.tool = _tool_with_audit
+
+
+# ── background job manager ────────────────────────────────────────────────────
+# LM Studio (and other MCP clients) enforce a hard ~30-60s timeout per tool
+# call (JSON-RPC error -32001). For long-running scans we spin the work off
+# in a background thread, return a job_id immediately, and let the agent poll
+# get_job(job_id) until status=done.
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict
+
+
+@dataclass
+class _Job:
+    id: str
+    tool: str
+    args: dict
+    started: datetime
+    finished: Optional[datetime] = None
+    status: str = "running"   # running | done | error | cancelled
+    result: Optional[str] = None
+    error: Optional[str] = None
+    thread: Optional[threading.Thread] = field(default=None, repr=False)
+
+
+_JOBS: Dict[str, _Job] = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_RETENTION_SECONDS = 3600   # keep finished jobs for 1 hour
+_JOB_MAX_KEEP = 100             # cap on total jobs kept in memory
+
+
+def _gc_jobs() -> None:
+    """Drop completed jobs older than retention window, oldest-first if over cap."""
+    now = datetime.now()
+    with _JOBS_LOCK:
+        # remove old finished jobs
+        to_drop = [
+            jid for jid, j in _JOBS.items()
+            if j.finished and (now - j.finished).total_seconds() > _JOB_RETENTION_SECONDS
+        ]
+        for jid in to_drop:
+            del _JOBS[jid]
+
+        # if still over cap, drop oldest finished
+        if len(_JOBS) > _JOB_MAX_KEEP:
+            finished_sorted = sorted(
+                ((jid, j) for jid, j in _JOBS.items() if j.finished),
+                key=lambda kv: kv[1].finished,
+            )
+            for jid, _ in finished_sorted[: len(_JOBS) - _JOB_MAX_KEEP]:
+                del _JOBS[jid]
 
 # ── disable DNS rebinding protection ──────────────────────────────────────────
 # mcp >= 1.10 ships with TransportSecurityMiddleware that rejects every
@@ -226,6 +293,149 @@ def _run(cmd: list[str], timeout: int = 120, stdin: Optional[str] = None) -> str
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
+
+# ─── Background jobs ───────────────────────────────────────────────────────────
+# Use these to run long scans without hitting the agent's request-timeout.
+
+@mcp.tool()
+def start_background_job(tool_name: str, arguments: Optional[dict] = None) -> str:
+    """
+    Run any other tool in the background. Returns a job_id immediately so the
+    agent doesn't block on long scans. Use this for nmap_scan, nikto_scan,
+    nuclei_scan, sqlmap_scan, masscan_scan, gobuster_scan, etc. — anything
+    that may take more than ~20 seconds.
+
+    Workflow:
+      1. job_id = start_background_job("nmap_scan", {"target": "10.0.0.1", "options": "-sV -A"})
+      2. wait a bit (~10s)
+      3. get_job(job_id)  → if still running, wait and call again
+                          → if done, returns the full output
+
+    Args:
+        tool_name: Name of any registered tool (e.g. "nmap_scan", "nuclei_scan")
+        arguments: Dict of arguments to pass to that tool
+    """
+    if tool_name not in _TOOL_REGISTRY:
+        available = ", ".join(sorted(_TOOL_REGISTRY))
+        return f"[error] unknown tool '{tool_name}'.\nAvailable: {available}"
+    if tool_name in {"start_background_job", "get_job", "list_jobs", "cancel_job"}:
+        return f"[error] cannot run '{tool_name}' as a background job"
+
+    arguments = arguments or {}
+    _gc_jobs()
+
+    job_id = uuid.uuid4().hex[:8]
+    job = _Job(id=job_id, tool=tool_name, args=dict(arguments), started=datetime.now())
+
+    fn = _TOOL_REGISTRY[tool_name]
+
+    def _run():
+        try:
+            job.result = fn(**arguments)
+            job.status = "done"
+        except Exception as e:
+            job.error = repr(e)
+            job.status = "error"
+        finally:
+            job.finished = datetime.now()
+
+    thread = threading.Thread(target=_run, daemon=True, name=f"job-{job_id}")
+    job.thread = thread
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+
+    thread.start()
+    _AUDIT.info(f"job_started id={job_id} tool={tool_name} args={json.dumps(arguments)[:200]}")
+
+    return (
+        f"job_id={job_id}\n"
+        f"status=running\n"
+        f"tool={tool_name}\n"
+        f"args={json.dumps(arguments)}\n\n"
+        f"The job is running in the background. Call get_job(job_id=\"{job_id}\") "
+        f"in ~10–60 seconds to retrieve the result."
+    )
+
+
+@mcp.tool()
+def get_job(job_id: str) -> str:
+    """
+    Fetch the current status (and result, if finished) of a background job.
+
+    Status values:
+      - running   : keep polling
+      - done      : full output is included below
+      - error     : the tool raised an exception (see error field)
+      - cancelled : cancel_job was called
+
+    Args:
+        job_id: ID returned by start_background_job
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if not job:
+        return f"[error] job '{job_id}' not found (it may have been garbage-collected)"
+
+    end_time = job.finished or datetime.now()
+    elapsed = (end_time - job.started).total_seconds()
+    header = (
+        f"job_id={job.id}\n"
+        f"tool={job.tool}\n"
+        f"status={job.status}\n"
+        f"elapsed={elapsed:.1f}s\n"
+        f"started={job.started.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+
+    if job.status == "running":
+        return header + "\n(still running — poll again in 15-30 seconds)"
+    if job.status == "error":
+        return header + f"\nERROR: {job.error}"
+    if job.status == "cancelled":
+        return header + "\n(cancelled before completion)"
+    # done
+    return header + f"\n--- output ---\n{job.result}"
+
+
+@mcp.tool()
+def list_jobs() -> str:
+    """List all background jobs (running and recently finished)."""
+    _gc_jobs()
+    with _JOBS_LOCK:
+        jobs = sorted(_JOBS.values(), key=lambda j: j.started, reverse=True)
+    if not jobs:
+        return "(no jobs)"
+    lines = [f"{'ID':<8}  {'STATUS':<10}  {'ELAPSED':>9}  TOOL"]
+    now = datetime.now()
+    for j in jobs:
+        end = j.finished or now
+        elapsed = (end - j.started).total_seconds()
+        lines.append(f"{j.id:<8}  {j.status:<10}  {elapsed:>7.1f}s  {j.tool}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def cancel_job(job_id: str) -> str:
+    """
+    Mark a running job as cancelled. Note: Python threads cannot be force-killed,
+    so the underlying subprocess will keep running until it finishes naturally;
+    its output is just discarded.
+
+    Args:
+        job_id: ID returned by start_background_job
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if not job:
+        return f"[error] job '{job_id}' not found"
+    if job.status != "running":
+        return f"job {job_id} is already {job.status}"
+    job.status = "cancelled"
+    job.finished = datetime.now()
+    return f"job {job_id} marked cancelled (underlying process may still finish in background)"
+
+
+# ─── System & shell ────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def system_info() -> str:

@@ -8,7 +8,12 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 ## Features
 
-32 tools exposed, grouped by pentesting phase:
+37 tools exposed, grouped by pentesting phase:
+
+**Background jobs** (avoids MCP timeout `-32001` on long scans)
+`start_background_job` · `get_job` · `list_jobs` · `cancel_job`
+
+
 
 **System & shell**
 `system_info` · `list_installed_tools` · `netstat_info` · `run_shell_command` · `apt_install_tool`
@@ -35,6 +40,22 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 `openssl_cert_info` · `hash_identify`
 
 > Output is automatically truncated to ~10 KB so large scan results don't blow the LLM context. Each tool checks if its binary is installed and, if not, prints the exact `apt install` command — Claude can then call `apt_install_tool` to self-heal.
+
+### Long-running scans
+
+MCP clients enforce a hard request timeout (~30–60s, JSON-RPC error `-32001`). For any scan that may exceed this, use background jobs:
+
+```
+start_background_job("nmap_scan", {"target": "10.0.0.0/24", "options": "-sV -A"})
+# → job_id=abc12345 status=running
+
+# wait ~30s
+get_job("abc12345")
+# → if running, poll again
+# → if done, full output is included
+```
+
+Jobs are kept in memory for 1 hour after completion, capped at 100 total. `cancel_job(job_id)` marks a job cancelled (the underlying subprocess may still finish — its output is just discarded).
 
 ---
 
