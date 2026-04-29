@@ -201,6 +201,71 @@ def _gc_jobs() -> None:
             for jid, _ in finished_sorted[: len(_JOBS) - _JOB_MAX_KEEP]:
                 del _JOBS[jid]
 
+
+# Sync wait window before heavy tools auto-detach into background jobs.
+# Must be comfortably under the MCP client request timeout (~30-60s).
+_SYNC_TIMEOUT = 25.0
+
+
+def _heavy(
+    tool_name: str,
+    args_for_log: dict,
+    cmd: list,
+    timeout: int = 600,
+) -> str:
+    """
+    Run `cmd` in a worker thread. If it finishes within _SYNC_TIMEOUT, return the
+    output inline. Otherwise register a background job and return its job_id so
+    the MCP client doesn't trip its request timeout (-32001).
+
+    The caller (heavy tool wrapper) can use this as a drop-in replacement for
+    the previous f"$ {' '.join(cmd)}\\n\\n{_run(cmd)}" pattern.
+    """
+    job_id = uuid.uuid4().hex[:8]
+    job = _Job(id=job_id, tool=tool_name, args=args_for_log, started=datetime.now())
+    finished_event = threading.Event()
+    cmd_str = " ".join(cmd)
+
+    def runner():
+        try:
+            job.result = f"$ {cmd_str}\n\n{_run(cmd, timeout=timeout)}"
+            job.status = "done"
+        except Exception as e:
+            job.error = repr(e)
+            job.status = "error"
+        finally:
+            job.finished = datetime.now()
+            finished_event.set()
+
+    t = threading.Thread(target=runner, daemon=True, name=f"heavy-{job_id}")
+    job.thread = t
+    t.start()
+
+    # Wait up to _SYNC_TIMEOUT for synchronous completion
+    if finished_event.wait(_SYNC_TIMEOUT):
+        if job.status == "done":
+            return job.result
+        return f"[error] {job.error}"
+
+    # Still running — register as a background job and return job_id
+    _gc_jobs()
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+    _AUDIT.info(
+        f"detach id={job_id} tool={tool_name} after_seconds={_SYNC_TIMEOUT}"
+    )
+
+    return (
+        f"[scan still running after {int(_SYNC_TIMEOUT)}s — detached to background]\n\n"
+        f"job_id={job_id}\n"
+        f"tool={tool_name}\n"
+        f"status=running\n"
+        f"command={cmd_str}\n\n"
+        f"Call get_job(job_id=\"{job_id}\") in 30-90 seconds to retrieve the result.\n"
+        f"You can also call list_jobs() to see this and other running scans."
+    )
+
+
 # ── disable DNS rebinding protection ──────────────────────────────────────────
 # mcp >= 1.10 ships with TransportSecurityMiddleware that rejects every
 # request whose Host header is not localhost. That kills remote clients
@@ -456,12 +521,15 @@ def nmap_scan(target: str, options: str = "-sV") -> str:
     Run an nmap scan against a target host, IP, or CIDR range.
     Only use against systems you are authorized to test.
 
+    If the scan exceeds 25s it auto-detaches as a background job and
+    returns a job_id; call get_job(job_id) to retrieve the result.
+
     Args:
         target:  IP address, hostname, or CIDR (e.g. 192.168.1.1 or 192.168.1.0/24)
         options: nmap flags (e.g. '-sV -sC -p 80,443 -A'). Default: '-sV'
     """
     cmd = ["nmap"] + options.split() + [target]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy("nmap_scan", {"target": target, "options": options}, cmd, timeout=600)
 
 
 @mcp.tool()
@@ -470,6 +538,8 @@ def nikto_scan(target: str, port: Optional[int] = None) -> str:
     Run a Nikto web vulnerability scan against a target.
     Only use against systems you are authorized to test.
 
+    Auto-detaches to a background job after 25s; poll get_job(job_id).
+
     Args:
         target: Target URL or IP (e.g. http://192.168.1.10 or 192.168.1.10)
         port:   Target port (optional, default 80)
@@ -477,7 +547,7 @@ def nikto_scan(target: str, port: Optional[int] = None) -> str:
     cmd = ["nikto", "-h", target]
     if port:
         cmd += ["-p", str(port)]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy("nikto_scan", {"target": target, "port": port}, cmd, timeout=600)
 
 
 @mcp.tool()
@@ -488,6 +558,7 @@ def gobuster_scan(
 ) -> str:
     """
     Run Gobuster directory/file enumeration on a web server.
+    Auto-detaches to a background job after 25s; poll get_job(job_id).
 
     Args:
         url:        Target URL (e.g. http://192.168.1.10)
@@ -497,7 +568,12 @@ def gobuster_scan(
     cmd = ["gobuster", "dir", "-u", url, "-w", wordlist]
     if extensions:
         cmd += ["-x", extensions]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "gobuster_scan",
+        {"url": url, "wordlist": wordlist, "extensions": extensions},
+        cmd,
+        timeout=600,
+    )
 
 
 @mcp.tool()
@@ -505,13 +581,14 @@ def sqlmap_scan(url: str, options: str = "--batch --level=1 --risk=1") -> str:
     """
     Run sqlmap to test for SQL injection vulnerabilities.
     Only use against systems you are authorized to test.
+    Auto-detaches to a background job after 25s; poll get_job(job_id).
 
     Args:
         url:     Target URL with parameter (e.g. 'http://site.com/page?id=1')
         options: Additional sqlmap options (default: '--batch --level=1 --risk=1')
     """
     cmd = ["sqlmap", "-u", url] + options.split()
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy("sqlmap_scan", {"url": url, "options": options}, cmd, timeout=900)
 
 
 @mcp.tool()
@@ -620,7 +697,11 @@ def theharvester_scan(domain: str, sources: str = "duckduckgo,bing,crtsh", limit
     if (hint := _require("theHarvester")):
         return hint
     cmd = ["theHarvester", "-d", domain, "-l", str(limit), "-b", sources]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=180)}"
+    return _heavy(
+        "theharvester_scan",
+        {"domain": domain, "sources": sources, "limit": limit},
+        cmd, timeout=300,
+    )
 
 
 @mcp.tool()
@@ -637,7 +718,11 @@ def subfinder_scan(domain: str, all_sources: bool = False) -> str:
     cmd = ["subfinder", "-d", domain, "-silent"]
     if all_sources:
         cmd.append("-all")
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=120)}"
+    return _heavy(
+        "subfinder_scan",
+        {"domain": domain, "all_sources": all_sources},
+        cmd, timeout=300,
+    )
 
 
 @mcp.tool()
@@ -685,7 +770,11 @@ def masscan_scan(target: str, ports: str = "1-1000", rate: int = 1000) -> str:
     if (hint := _require("masscan")):
         return hint
     cmd = ["masscan", target, "-p", ports, "--rate", str(rate)]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "masscan_scan",
+        {"target": target, "ports": ports, "rate": rate},
+        cmd, timeout=600,
+    )
 
 
 @mcp.tool()
@@ -747,7 +836,11 @@ def ffuf_scan(
     cmd = ["ffuf", "-u", url, "-w", wordlist, "-mc", match_codes, "-s"]
     if extensions:
         cmd += ["-e", "," + extensions if not extensions.startswith(",") else extensions]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "ffuf_scan",
+        {"url": url, "wordlist": wordlist, "extensions": extensions, "match_codes": match_codes},
+        cmd, timeout=600,
+    )
 
 
 @mcp.tool()
@@ -764,7 +857,11 @@ def wpscan_scan(url: str, enumerate: str = "vp,vt,u") -> str:
     if (hint := _require("wpscan")):
         return hint
     cmd = ["wpscan", "--url", url, "--enumerate", enumerate, "--no-update", "--random-user-agent"]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "wpscan_scan",
+        {"url": url, "enumerate": enumerate},
+        cmd, timeout=600,
+    )
 
 
 @mcp.tool()
@@ -783,7 +880,11 @@ def nuclei_scan(target: str, severity: str = "medium,high,critical", tags: Optio
     cmd = ["nuclei", "-u", target, "-severity", severity, "-silent", "-nc"]
     if tags:
         cmd += ["-tags", tags]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "nuclei_scan",
+        {"target": target, "severity": severity, "tags": tags},
+        cmd, timeout=900,
+    )
 
 
 # ─── Vulnerability assessment ──────────────────────────────────────────────────
@@ -804,7 +905,11 @@ def nmap_vuln_scan(target: str, ports: Optional[str] = None) -> str:
     if ports:
         cmd += ["-p", ports]
     cmd.append(target)
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=600)}"
+    return _heavy(
+        "nmap_vuln_scan",
+        {"target": target, "ports": ports},
+        cmd, timeout=900,
+    )
 
 
 @mcp.tool()
@@ -837,7 +942,11 @@ def enum4linux_scan(target: str, options: str = "-a") -> str:
     if (hint := _require("enum4linux")):
         return hint
     cmd = ["enum4linux"] + options.split() + [target]
-    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=300)}"
+    return _heavy(
+        "enum4linux_scan",
+        {"target": target, "options": options},
+        cmd, timeout=600,
+    )
 
 
 @mcp.tool()
