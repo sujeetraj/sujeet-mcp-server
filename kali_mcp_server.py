@@ -11,11 +11,102 @@ Usage:
 """
 
 import argparse
+import functools
+import json
+import logging
+import logging.handlers
+import os
 import subprocess
 import shutil
 import sys
-from typing import Optional
+import time
+from pathlib import Path
+from typing import Any, Callable, Optional
 from mcp.server.fastmcp import FastMCP
+
+# ── audit logging ─────────────────────────────────────────────────────────────
+# Every tool call is logged with: timestamp, tool name, arguments,
+# duration, output preview, and whether it errored.
+#
+# Logs go to:
+#   1. stderr  → captured by systemd journal (journalctl -u kali-mcp-server)
+#   2. /var/log/kali-mcp-server/audit.log  (rotated daily, 14 days kept)
+#      falls back to ~/.kali-mcp-server/audit.log if /var/log isn't writable
+#
+# View with:
+#   tail -f /var/log/kali-mcp-server/audit.log
+#   journalctl -u kali-mcp-server -f | grep AUDIT
+
+def _setup_audit_logger() -> logging.Logger:
+    log = logging.getLogger("kali-mcp-audit")
+    if log.handlers:  # already configured (re-import safety)
+        return log
+    log.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s [AUDIT] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # 1. stderr → systemd journal
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+
+    # 2. file with daily rotation
+    candidates = [Path("/var/log/kali-mcp-server"),
+                  Path.home() / ".kali-mcp-server"]
+    for log_dir in candidates:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "audit.log"
+            fh = logging.handlers.TimedRotatingFileHandler(
+                log_file, when="midnight", backupCount=14, encoding="utf-8",
+            )
+            fh.setFormatter(fmt)
+            log.addHandler(fh)
+            log.info(f"audit log file: {log_file}")
+            break
+        except (PermissionError, OSError):
+            continue
+
+    log.propagate = False
+    return log
+
+
+_AUDIT = _setup_audit_logger()
+
+
+def _audit(tool_name: str) -> Callable:
+    """Decorator that logs every tool call with args, duration, and result preview."""
+    def decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # serialise kwargs safely (truncate long values)
+            shown_args = {}
+            for k, v in kwargs.items():
+                s = str(v)
+                shown_args[k] = (s[:200] + "…") if len(s) > 200 else s
+
+            call_id = f"{int(time.time()*1000) & 0xffffff:06x}"
+            _AUDIT.info(
+                f"call={call_id} tool={tool_name} args={json.dumps(shown_args, ensure_ascii=False)}"
+            )
+            t0 = time.perf_counter()
+            try:
+                result = fn(*args, **kwargs)
+                dur_ms = int((time.perf_counter() - t0) * 1000)
+                preview = (result[:300].replace("\n", " ⏎ ") + "…") if len(result) > 300 else result.replace("\n", " ⏎ ")
+                _AUDIT.info(
+                    f"call={call_id} tool={tool_name} done dur_ms={dur_ms} "
+                    f"out_bytes={len(result)} preview={preview!r}"
+                )
+                return result
+            except Exception as e:
+                dur_ms = int((time.perf_counter() - t0) * 1000)
+                _AUDIT.error(
+                    f"call={call_id} tool={tool_name} ERROR dur_ms={dur_ms} err={e!r}"
+                )
+                raise
+        return wrapper
+    return decorator
 
 # ── server instance ───────────────────────────────────────────────────────────
 mcp = FastMCP(
@@ -26,6 +117,22 @@ mcp = FastMCP(
         "Use only against systems you are authorized to test."
     ),
 )
+
+# ── auto-audit every @mcp.tool() ──────────────────────────────────────────────
+# Wrap FastMCP's tool decorator so any function registered with @mcp.tool()
+# is automatically wrapped with @_audit(name) before registration.
+_original_tool = mcp.tool
+
+def _tool_with_audit(*dargs, **dkwargs):
+    inner_decorator = _original_tool(*dargs, **dkwargs)
+
+    def wrapper(fn):
+        audited = _audit(fn.__name__)(fn)
+        functools.update_wrapper(audited, fn)
+        return inner_decorator(audited)
+    return wrapper
+
+mcp.tool = _tool_with_audit
 
 # ── disable DNS rebinding protection ──────────────────────────────────────────
 # mcp >= 1.10 ships with TransportSecurityMiddleware that rejects every

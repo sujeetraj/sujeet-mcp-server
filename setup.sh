@@ -71,6 +71,14 @@ ok "Dependencies installed in venv."
 # fix ownership
 chown -R "$RUN_AS:$RUN_AS" "$INSTALL_DIR"
 
+# ── step 2b: create audit log directory (writable by service user) ───────────
+LOG_DIR="/var/log/kali-mcp-server"
+info "Creating audit log directory $LOG_DIR ..."
+mkdir -p "$LOG_DIR"
+chown "$RUN_AS:$RUN_AS" "$LOG_DIR"
+chmod 750 "$LOG_DIR"
+ok "Audit log directory ready."
+
 # ── step 3: write systemd unit ────────────────────────────────────────────────
 info "Writing systemd service to $SERVICE_FILE ..."
 cat > "$SERVICE_FILE" <<EOF
