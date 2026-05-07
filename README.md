@@ -8,7 +8,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 ## Features
 
-37 tools exposed, grouped by pentesting phase:
+54 tools exposed, grouped by pentesting phase:
 
 **Background jobs** (avoids MCP timeout `-32001` on long scans)
 `start_background_job` · `get_job` · `list_jobs` · `cancel_job`
@@ -31,7 +31,16 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 `searchsploit_lookup`
 
 **SMB / Active Directory**
-`enum4linux_scan` · `smbmap_scan`
+`enum4linux_scan` · `smbmap_scan` · `smbclient_list` · `rpcclient_enum` · `crackmapexec_scan` · `ldapsearch_enum`
+
+**Password / hash attacks**
+`hydra_attack` · `medusa_attack` · `john_crack` · `hashcat_crack` · `crunch_wordlist`
+
+**Exploitation** (Metasploit, read-only)
+`msf_search` · `msf_info` · `msf_check`
+
+**Reverse engineering**
+`objdump_disasm` · `readelf_info` · `radare2_analysis` · `xxd_hexdump` · `nm_symbols`
 
 **Forensics / file analysis**
 `binwalk_scan` · `strings_extract` · `exiftool_read` · `file_info`

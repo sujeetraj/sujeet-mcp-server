@@ -308,8 +308,22 @@ _APT_PACKAGE_MAP = {
     "nuclei":       "nuclei",
     "searchsploit": "exploitdb",
     "smbmap":       "smbmap",
+    "smbclient":    "smbclient",
+    "rpcclient":    "smbclient",
+    "ldapsearch":   "ldap-utils",
+    "crackmapexec": "crackmapexec",
     "enum4linux":   "enum4linux",
     "exiftool":     "libimage-exiftool-perl",
+    "hydra":        "hydra",
+    "medusa":       "medusa",
+    "john":         "john",
+    "hashcat":      "hashcat",
+    "crunch":       "crunch",
+    "objdump":      "binutils",
+    "readelf":      "binutils",
+    "nm":           "binutils",
+    "r2":           "radare2",
+    "xxd":          "xxd",
 }
 
 
@@ -666,10 +680,12 @@ def list_installed_tools() -> str:
         "Web app":              ["nikto", "gobuster", "ffuf", "dirb", "wfuzz", "wpscan",
                                  "nuclei", "sqlmap"],
         "Vuln assessment":      ["searchsploit"],
-        "SMB / AD":             ["enum4linux", "smbmap", "smbclient", "crackmapexec"],
-        "Password attacks":     ["hydra", "john", "hashcat", "hashid", "crunch"],
-        "Forensics / files":    ["binwalk", "strings", "exiftool", "file", "foremost"],
+        "SMB / AD":             ["enum4linux", "smbmap", "smbclient", "rpcclient",
+                                 "crackmapexec", "ldapsearch"],
+        "Password attacks":     ["hydra", "medusa", "john", "hashcat", "hashid", "crunch"],
         "Exploitation":         ["msfconsole"],
+        "Reverse engineering":  ["objdump", "readelf", "nm", "r2", "xxd", "ltrace", "strace"],
+        "Forensics / files":    ["binwalk", "strings", "exiftool", "file", "foremost"],
         "Wireless":             ["aircrack-ng", "airmon-ng"],
     }
     out = ["Kali Linux Tool Status:"]
@@ -1053,6 +1069,525 @@ def openssl_cert_info(host: str, port: int = 443) -> str:
     return f"$ openssl s_client → openssl x509\n\n{parsed}"
 
 
+# ─── Password / hash attacks ───────────────────────────────────────────────────
+
+@mcp.tool()
+def hydra_attack(
+    target: str,
+    service: str,
+    username: Optional[str] = None,
+    user_list: Optional[str] = None,
+    password: Optional[str] = None,
+    password_list: Optional[str] = None,
+    port: Optional[int] = None,
+    threads: int = 4,
+    extra_options: str = "",
+) -> str:
+    """
+    Online password brute-force attack with hydra. Auto-detaches if it runs >25s.
+
+    Examples:
+      hydra_attack("10.0.0.1", "ssh", username="admin",
+                   password_list="/usr/share/wordlists/rockyou.txt")
+      hydra_attack("10.0.0.1", "ftp", user_list="users.txt", password_list="passwords.txt")
+
+    Args:
+        target:        Target IP or hostname.
+        service:       hydra service module — ssh, ftp, http-get, http-post-form,
+                       smb, rdp, mysql, postgres, vnc, etc.
+        username:      Single username to test
+        user_list:     Path to a file of usernames (use either username or user_list)
+        password:      Single password
+        password_list: Path to a file of passwords (use either password or password_list)
+        port:          Override default service port
+        threads:       Parallel tasks (default 4, hydra max is 16 by default)
+        extra_options: Any extra hydra flags (e.g. '-V' verbose, '-f' stop on first hit)
+    """
+    if (hint := _require("hydra")):
+        return hint
+    cmd = ["hydra"]
+    if username:
+        cmd += ["-l", username]
+    elif user_list:
+        cmd += ["-L", user_list]
+    if password:
+        cmd += ["-p", password]
+    elif password_list:
+        cmd += ["-P", password_list]
+    cmd += ["-t", str(threads)]
+    if port:
+        cmd += ["-s", str(port)]
+    if extra_options:
+        cmd += extra_options.split()
+    cmd += [target, service]
+    return _heavy(
+        "hydra_attack",
+        {"target": target, "service": service, "username": username,
+         "user_list": user_list, "password_list": password_list, "port": port},
+        cmd, timeout=1800,
+    )
+
+
+@mcp.tool()
+def medusa_attack(
+    target: str,
+    module: str,
+    username: Optional[str] = None,
+    user_list: Optional[str] = None,
+    password: Optional[str] = None,
+    password_list: Optional[str] = None,
+    threads: int = 4,
+) -> str:
+    """
+    Parallel online brute-force with medusa (alternative to hydra).
+
+    Args:
+        target:        IP or hostname
+        module:        Service module — ssh, ftp, http, smbnt, rdp, mysql, etc.
+        username:      Single username
+        user_list:     Path to username file
+        password:      Single password
+        password_list: Path to password file
+        threads:       Concurrent tasks (default 4)
+    """
+    if (hint := _require("medusa")):
+        return hint
+    cmd = ["medusa", "-h", target, "-M", module, "-t", str(threads)]
+    if username:
+        cmd += ["-u", username]
+    elif user_list:
+        cmd += ["-U", user_list]
+    if password:
+        cmd += ["-p", password]
+    elif password_list:
+        cmd += ["-P", password_list]
+    return _heavy(
+        "medusa_attack",
+        {"target": target, "module": module, "username": username,
+         "user_list": user_list, "password_list": password_list},
+        cmd, timeout=1800,
+    )
+
+
+@mcp.tool()
+def john_crack(
+    hash_file: str,
+    wordlist: Optional[str] = None,
+    format: Optional[str] = None,
+    show: bool = False,
+    rules: bool = False,
+) -> str:
+    """
+    Offline hash cracking with John the Ripper.
+
+    Args:
+        hash_file: Path to a file containing one or more hashes
+        wordlist:  Path to wordlist (e.g. /usr/share/wordlists/rockyou.txt).
+                   If omitted, john uses its default mode.
+        format:    Hash format hint, e.g. 'raw-md5', 'nt', 'sha512crypt'.
+                   Run `john --list=formats` for the full list.
+        show:      If True, only show already-cracked passwords (--show)
+        rules:     If True, apply mangling rules (--rules)
+    """
+    if (hint := _require("john")):
+        return hint
+    cmd = ["john"]
+    if show:
+        cmd.append("--show")
+    if wordlist:
+        cmd.append(f"--wordlist={wordlist}")
+    if rules:
+        cmd.append("--rules")
+    if format:
+        cmd.append(f"--format={format}")
+    cmd.append(hash_file)
+    return _heavy(
+        "john_crack",
+        {"hash_file": hash_file, "wordlist": wordlist, "format": format, "show": show},
+        cmd, timeout=1800,
+    )
+
+
+@mcp.tool()
+def hashcat_crack(
+    hash_file: str,
+    wordlist: str,
+    hash_mode: int,
+    attack_mode: int = 0,
+    show: bool = False,
+    extra_options: str = "",
+) -> str:
+    """
+    GPU-accelerated hash cracking with hashcat.
+
+    Common hash_mode values:
+       0 = MD5      100 = SHA1      1000 = NTLM       1800 = sha512crypt
+     500 = md5crypt 1400 = SHA256   2500 = WPA-EAPOL  3200 = bcrypt
+
+    Common attack_mode values:
+      0 = straight (wordlist)   1 = combination
+      3 = brute-force / mask    6 = hybrid wordlist+mask
+
+    Args:
+        hash_file:     Path to file with hashes (one per line)
+        wordlist:      Path to wordlist (or mask string for attack_mode=3)
+        hash_mode:     hashcat -m number (see list above)
+        attack_mode:   hashcat -a number (default 0 = straight)
+        show:          Show already-cracked hashes only (--show)
+        extra_options: Extra hashcat flags (e.g. '-O' optimized kernels)
+    """
+    if (hint := _require("hashcat")):
+        return hint
+    cmd = ["hashcat", "-m", str(hash_mode), "-a", str(attack_mode), hash_file, wordlist]
+    if show:
+        cmd.append("--show")
+    if extra_options:
+        cmd += extra_options.split()
+    return _heavy(
+        "hashcat_crack",
+        {"hash_file": hash_file, "wordlist": wordlist,
+         "hash_mode": hash_mode, "attack_mode": attack_mode},
+        cmd, timeout=1800,
+    )
+
+
+@mcp.tool()
+def crunch_wordlist(
+    min_len: int,
+    max_len: int,
+    charset: Optional[str] = None,
+    pattern: Optional[str] = None,
+    max_lines: int = 1000,
+) -> str:
+    """
+    Generate a wordlist with crunch. Output is capped to `max_lines` so the
+    LLM context isn't blown out — for full output, write to disk via
+    run_shell_command.
+
+    Args:
+        min_len:   Minimum word length
+        max_len:   Maximum word length
+        charset:   Characters to use (default: lowercase a-z if omitted)
+        pattern:   Optional crunch pattern (e.g. '@@%%' for 2 letters + 2 digits)
+        max_lines: Max lines to return inline (default 1000)
+    """
+    if (hint := _require("crunch")):
+        return hint
+    cmd = ["crunch", str(min_len), str(max_len)]
+    if charset:
+        cmd.append(charset)
+    if pattern:
+        cmd += ["-t", pattern]
+    # pipe through head to limit output
+    bash_cmd = " ".join(cmd) + f" 2>/dev/null | head -n {max_lines}"
+    return _heavy(
+        "crunch_wordlist",
+        {"min_len": min_len, "max_len": max_len, "charset": charset,
+         "pattern": pattern, "max_lines": max_lines},
+        ["bash", "-c", bash_cmd], timeout=120,
+    )
+
+
+# ─── SMB / Active Directory (extended) ─────────────────────────────────────────
+
+@mcp.tool()
+def smbclient_list(target: str, username: str = "", password: str = "") -> str:
+    """
+    List SMB shares on a target. Empty username/password = anonymous.
+
+    Args:
+        target:   IP or hostname (without leading //)
+        username: SMB username (empty = anonymous)
+        password: SMB password (empty = anonymous)
+    """
+    if (hint := _require("smbclient")):
+        return hint
+    if username:
+        cmd = ["smbclient", "-L", f"//{target}", "-U", f"{username}%{password}"]
+    else:
+        cmd = ["smbclient", "-L", f"//{target}", "-N"]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def rpcclient_enum(
+    target: str,
+    command: str = "enumdomusers",
+    username: str = "",
+    password: str = "",
+) -> str:
+    """
+    Run an rpcclient command against an SMB host. Useful for AD/Samba enum.
+
+    Common commands:
+      enumdomusers   — list domain users
+      enumdomgroups  — list domain groups
+      querydominfo   — domain info
+      lookupnames    — translate names ↔ SIDs
+      srvinfo        — server info
+
+    Args:
+        target:   IP or hostname
+        command:  rpcclient command to run (default: enumdomusers)
+        username: SMB username (empty = anonymous null session)
+        password: SMB password
+    """
+    if (hint := _require("rpcclient")):
+        return hint
+    if username:
+        cmd = ["rpcclient", "-U", f"{username}%{password}", "-c", command, target]
+    else:
+        cmd = ["rpcclient", "-U", "", "-N", "-c", command, target]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def crackmapexec_scan(
+    protocol: str,
+    target: str,
+    username: str = "",
+    password: str = "",
+    extra_options: str = "",
+) -> str:
+    """
+    Run crackmapexec — multi-protocol AD enumeration & lateral movement tool.
+    Auto-detaches if it runs >25s.
+
+    Args:
+        protocol:      smb | winrm | ssh | ldap | mssql | rdp | ftp
+        target:        IP, hostname, range, or file path with targets
+        username:      Username (empty = null session for SMB)
+        password:      Password or NTLM hash (use 'NTHASH:abc...' format for hash)
+        extra_options: Additional CME flags, e.g.
+                         '--shares' (list shares),
+                         '--users'  (enumerate users),
+                         '--pass-pol' (password policy),
+                         '-M spider_plus' (run a module)
+    """
+    if (hint := _require("crackmapexec")):
+        return hint
+    cmd = ["crackmapexec", protocol, target]
+    if username:
+        cmd += ["-u", username, "-p", password]
+    if extra_options:
+        cmd += extra_options.split()
+    return _heavy(
+        "crackmapexec_scan",
+        {"protocol": protocol, "target": target,
+         "username": username, "extra_options": extra_options},
+        cmd, timeout=600,
+    )
+
+
+@mcp.tool()
+def ldapsearch_enum(
+    server: str,
+    base_dn: str,
+    bind_dn: Optional[str] = None,
+    bind_password: Optional[str] = None,
+    search_filter: str = "(objectClass=*)",
+    attributes: Optional[str] = None,
+    port: int = 389,
+) -> str:
+    """
+    Query an LDAP server (e.g. an Active Directory domain controller).
+
+    Args:
+        server:        LDAP server IP/hostname (no protocol prefix)
+        base_dn:       Search base, e.g. 'DC=corp,DC=local'
+        bind_dn:       Optional bind DN, e.g. 'CN=admin,CN=Users,DC=corp,DC=local'
+                       (omit for anonymous bind)
+        bind_password: Bind password (only used if bind_dn is set)
+        search_filter: LDAP filter (default: '(objectClass=*)')
+        attributes:    Space-separated attributes to fetch (e.g. 'cn samAccountName')
+        port:          LDAP port (default: 389; use 636 for LDAPS)
+    """
+    if (hint := _require("ldapsearch")):
+        return hint
+    proto = "ldaps" if port == 636 else "ldap"
+    cmd = ["ldapsearch", "-x", "-H", f"{proto}://{server}:{port}", "-b", base_dn]
+    if bind_dn:
+        cmd += ["-D", bind_dn, "-w", bind_password or ""]
+    cmd.append(search_filter)
+    if attributes:
+        cmd += attributes.split()
+    return f"$ ldapsearch ...\n\n{_run(cmd, timeout=60)}"
+
+
+# ─── Exploitation (Metasploit, read-only / safe) ───────────────────────────────
+
+def _msf_run(commands: list[str], tool: str, args: dict, timeout: int = 300) -> str:
+    """Helper: run a Metasploit batch of commands non-interactively."""
+    if (hint := _require("msfconsole")):
+        return hint
+    script = "; ".join(commands + ["exit"])
+    cmd = ["msfconsole", "-q", "-n", "-x", script]
+    return _heavy(tool, args, cmd, timeout=timeout)
+
+
+@mcp.tool()
+def msf_search(query: str) -> str:
+    """
+    Search Metasploit modules by keyword, CVE, or platform.
+
+    Args:
+        query: Search terms — e.g. 'eternalblue', 'CVE-2021-41773',
+               'type:exploit platform:windows'
+    """
+    return _msf_run([f"search {query}"], "msf_search", {"query": query}, timeout=180)
+
+
+@mcp.tool()
+def msf_info(module_path: str) -> str:
+    """
+    Get the info page for a Metasploit module (description, options, references).
+
+    Args:
+        module_path: Full module path, e.g.
+                     'exploit/windows/smb/ms17_010_eternalblue'
+                     'auxiliary/scanner/ssh/ssh_login'
+    """
+    return _msf_run([f"info {module_path}"], "msf_info",
+                    {"module_path": module_path}, timeout=180)
+
+
+@mcp.tool()
+def msf_check(
+    module_path: str,
+    rhosts: str,
+    rport: Optional[int] = None,
+    options: str = "",
+) -> str:
+    """
+    Run the 'check' action of a Metasploit module against a target.
+    This does NOT exploit — it only probes whether the target appears vulnerable.
+    Not all modules implement check.
+
+    Args:
+        module_path: Full module path (exploit/* or auxiliary/*)
+        rhosts:      Target host or CIDR
+        rport:       Optional target port
+        options:     Semicolon-separated extra options, e.g.
+                     'TARGETURI=/admin; SSL=true'
+    """
+    setup = [f"use {module_path}", f"set RHOSTS {rhosts}"]
+    if rport:
+        setup.append(f"set RPORT {rport}")
+    for opt in options.split(";"):
+        opt = opt.strip()
+        if opt:
+            setup.append(f"set {opt}")
+    setup.append("check")
+    return _msf_run(setup, "msf_check",
+                    {"module_path": module_path, "rhosts": rhosts,
+                     "rport": rport, "options": options}, timeout=600)
+
+
+# ─── Reverse engineering ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def objdump_disasm(
+    file_path: str,
+    section: str = ".text",
+    arch: Optional[str] = None,
+) -> str:
+    """
+    Disassemble a section of a binary using objdump.
+
+    Args:
+        file_path: Absolute path to the binary
+        section:   Section to disassemble (default: '.text'; use '*' for all)
+        arch:      Optional architecture override (e.g. 'i386:x86-64', 'arm')
+    """
+    if (hint := _require("objdump")):
+        return hint
+    cmd = ["objdump", "-d"]
+    if section and section != "*":
+        cmd += ["-j", section]
+    if arch:
+        cmd += ["-m", arch]
+    cmd.append(file_path)
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=60)}"
+
+
+@mcp.tool()
+def readelf_info(file_path: str, options: str = "-h") -> str:
+    """
+    Display ELF file structure information.
+
+    Common options:
+      -h  ELF header     -l  program headers   -S  section headers
+      -s  symbol tables  -d  dynamic section   -r  relocations
+      -a  all of above   -e  full headers      -n  notes
+
+    Args:
+        file_path: Absolute path to the ELF file
+        options:   readelf flags (default: '-h')
+    """
+    if (hint := _require("readelf")):
+        return hint
+    cmd = ["readelf"] + options.split() + [file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=30)}"
+
+
+@mcp.tool()
+def radare2_analysis(file_path: str, commands: str = "iI") -> str:
+    """
+    Run radare2 commands against a binary in batch mode.
+
+    Common commands (chain with ';'):
+      iI    info             il  libraries        ie  entrypoints
+      is    symbols          ii  imports          iE  exports
+      iz    strings (data)   izz strings (all)
+      aaa   analyze all      afl list functions   pdf @ main  disasm main
+
+    Args:
+        file_path: Absolute path to the binary
+        commands:  r2 command(s) to execute (default: 'iI')
+    """
+    if (hint := _require("r2")):
+        return hint
+    cmd = ["r2", "-A", "-q", "-c", commands, file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=120)}"
+
+
+@mcp.tool()
+def xxd_hexdump(file_path: str, max_bytes: int = 1024, offset: int = 0) -> str:
+    """
+    Hex dump a file (or a portion of it).
+
+    Args:
+        file_path: Absolute path to the file
+        max_bytes: Maximum bytes to dump (default: 1024)
+        offset:    Byte offset to start from (default: 0)
+    """
+    if (hint := _require("xxd")):
+        return hint
+    cmd = ["xxd", "-l", str(max_bytes), "-s", str(offset), file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=15)}"
+
+
+@mcp.tool()
+def nm_symbols(file_path: str, options: str = "-D") -> str:
+    """
+    List symbols from an object file or shared library.
+
+    Common options:
+      -D            dynamic symbols (for shared libs)
+      --defined-only only defined symbols (skip undefined)
+      -u            only undefined
+      -C            demangle C++ symbol names
+
+    Args:
+        file_path: Absolute path to the object/library
+        options:   nm flags (default: '-D')
+    """
+    if (hint := _require("nm")):
+        return hint
+    cmd = ["nm"] + options.split() + [file_path]
+    return f"$ {' '.join(cmd)}\n\n{_run(cmd, timeout=30)}"
+
+
 # ─── Self-management ───────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -1070,8 +1605,10 @@ def apt_install_tool(package: str) -> str:
         "nmap", "nikto", "gobuster", "sqlmap", "whatweb", "wafw00f",
         "dnsenum", "fierce", "masscan", "arp-scan", "traceroute",
         "ffuf", "dirb", "wfuzz", "wpscan", "nuclei", "exploitdb",
-        "enum4linux", "smbmap", "binwalk", "exiftool", "hashid",
-        "hydra", "john", "hashcat", "openssl",
+        "enum4linux", "smbmap", "smbclient", "ldap-utils", "crackmapexec",
+        "binwalk", "exiftool", "hashid",
+        "hydra", "medusa", "john", "hashcat", "crunch", "openssl",
+        "metasploit-framework", "binutils", "radare2", "xxd",
     }
     if package not in allowed:
         return f"[blocked] '{package}' is not in the allowed install list."
